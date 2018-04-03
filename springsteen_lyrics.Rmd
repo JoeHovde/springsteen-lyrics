@@ -1,0 +1,250 @@
+---
+title: "Springsteen Lyric Analysis Using geniusR Package"
+output: html_notebook
+---
+
+I am Using Josiah Parry's [geniusR package](https://medium.com/@JosiahParry/introducing-geniusr-b0177ce7b4d7) to scrape Bruce Springsteen lyrics. I have worked on lyric scraping before and it can be a pain, so I'm really excited about this package.
+
+I'll then use tidytext to analyse them.
+```{r}
+devtools::install_github("josiahparry/geniusR")   # the geniusR package isn't on CRAN, so load with devtools
+library(geniusR) 
+library(tidyverse)
+library(tidytext)
+library(rvest)
+library(readr)
+library(lubridate)
+library(igraph)
+library(ggraph)
+```
+
+Checking out some of the capabilities
+
+```{r}
+# tracklist from "suck it and see"
+genius_tracklist(artist = "Bruce Springsteen", album = "Born in the U.S.A.")
+```
+Cool!
+
+I want to get all of Springsteen's lyrics from each album. There isn't a function do this in geniusR, and looking at the Genius website, it makes sense why: to show all the albums for an artist, you have to click through a link on the artist's page; this opens an interactive box that doesn't have its own URL. This would make it tougher to scrape.
+
+To deal with this, I'm going to scrape Springsteen's album titles from Wikipedia. Bruce has a [Wikipedia page](https://en.wikipedia.org/wiki/Bruce_Springsteen_discography) for his discography that I found by googling "Springsteen Albums." It has a table of his albums that should be easy to scrape with RVest.
+
+I am also going to scrape the dates, which are formatted sort of messily (they are bullet points within cells in the table). It will add a little work to scrape and clean them but they'll be useful for analyzing change in lyrics / sentiment over time.
+
+If you're not familiar with RVest, there's a great tutorial [here](https://www.datacamp.com/community/tutorials/r-web-scraping-rvest). I also use the [SelectorGadget](http://selectorgadget.com/) tool to find the proper CSS element for the <code>html_nodes()</code> function; it's incredibly useful.
+
+#### Scraping wikipedia for album titles and dates
+
+```{r}
+wiki_url <- "https://en.wikipedia.org/wiki/Bruce_Springsteen_discography"
+
+# pulling album titles
+alb_titles <- html_session(wiki_url) %>% 
+  html_nodes(".plainrowheaders:nth-child(12) tr~ tr+ tr th") %>%   # found the html node using SelectorGadget
+  html_text() %>% 
+  data_frame()
+
+names(alb_titles) <- c("title")
+
+# getting release dates
+alb_dates <- html_session(wiki_url) %>% 
+  html_nodes(".plainrowheaders:nth-child(12) th+ td li:nth-child(1)") %>%
+  # again, found the right node by using SelectorGadget
+  html_text() %>% 
+  data_frame()
+ 
+names(alb_dates) <- c("date")
+
+# combining the two data frames
+albums <- cbind(alb_titles, alb_dates)
+
+head(albums)
+```
+
+This looks good, but I'll have to remove the extra text in the date column in order to convert them to dates and analyze them as such.
+
+#### Cleaning dates
+```{r}
+albums$date <- gsub("Released: ", "", albums$date)
+
+albums
+```
+These look better, but there's a pesky [21] after "Nebraska | September 30, 1982". This is a link to a footnote on the Wikipedia page. I could just reomove this manually but in the interest of repeatability I'll use Regex to remove anything between brackets.
+
+Thanks to an incredibly helpful [StackOverflow answer](https://stackoverflow.com/questions/23966678/remove-all-text-between-two-brackets) for the regex.
+
+```{r}
+albums$date <- gsub("\\[[^\\]]*\\]", "", albums$date, perl=TRUE)
+
+# make sure leading and trailing spaces are deleted
+albums$date <- trimws(albums$date)
+
+albums
+```
+
+Looks good. Now we'll cast the dates as dates. This is a very helpful site for datetime formatting, that's where I got the <code>"%B %d, %Y"</code>
+
+```{r}
+albums$date <- as.Date(albums$date, "%B %d, %Y")
+
+albums
+```
+#### Cleaning album titles
+I missed this at the beginning, but there's a "\n" in "The Wild, the Innocent & the E Street Shuffle" and "We Shall Overcome: The Seeger Sessions. This will need to be removed before we continue.
+
+```{r}
+albums$title <- gsub("\n", " ", albums$title)
+```
+
+I'll also  have to sub out the ampersand in "The Wild, The Innocent & the E Street Shuffle" for an "and". I discovered this after trying the below loop and seeing it fail; so if you're trying to do something similar don't be surprised if you see some errors. Any non-standard punctuation can be tricky here.
+
+Apparently the ampersand is just removed in the genius url for "Devils & Dust". (The url is https://genius.com/albums/Bruce-springsteen/Devils-dust) This is frustrating, and I'm just going to correct it manually.
+
+```{r}
+albums$title <- gsub("&", "and", albums$title)
+
+# remove ampersand for devils and dust
+
+albums$title[13] <- gsub("and ", "", albums$title[13])
+```
+
+Now that we have every album, we want to get the lyrics for each album. I am doing it with a for loop, even though I should probably do it with apply. I have found apply to be a lot harder to put to use though, if you have any suggestions on how to use it here please let me know :)
+
+#### Getting lyrics
+```{r}
+bruce_lyr <- data_frame()
+for(i in 1:nrow(albums)){
+  current_lyr <- genius_album("Bruce Springsteen", albums$title[i]) %>% 
+    mutate(album = albums$title[i])
+  bruce_lyr <- rbind(bruce_lyr, current_lyr)
+  message(albums$title[i])
+}
+
+head(bruce_lyr)
+```
+
+Joining this with <code>albums</code> to add the dates
+
+```{r}
+bruce_lyr <- bruce_lyr %>% 
+  inner_join(albums, by = c("album" = "title"))
+
+write_csv(bruce_lyr, "bruce_lyr.csv")
+```
+
+Great! Now we have all the lyrics to all of their albums and their dates. We can start analyzing this.
+
+First, I'm going to look at sentiment over time. I'll do this using tidytext principles. I'll tokenize the lyrics by word, then join them with a sentiment lexicon and find the average sentiment for each song / album etc.
+
+```{r}
+bruce_words <- bruce_lyr %>% 
+  unnest_tokens(word, text)
+
+bruce_words %>% 
+  filter(album == "The River")
+
+bruce_words %>% 
+  arrange(date) %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(title, album) %>% 
+  summarise(sentiment = mean(score)) %>% 
+  ggplot(aes(x = title, y = sentiment)) +
+  facet_wrap(~album, ncol = 4, scales = "free") +
+  geom_col(aes(fill = album),
+           show.legend = FALSE) +
+  coord_flip()
+```
+
+Albums
+
+```{r}
+bruce_words %>% 
+  arrange(date) %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  group_by(album) %>% 
+  summarise(sentiment = mean(score), year = mean(year(date))) %>% 
+  ggplot(aes(x = reorder(album, year), y = sentiment)) +
+  geom_col(aes(fill = album),
+           show.legend = FALSE) +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1))
+```
+
+Looking at most important words
+
+```{r}
+bruce_words %>% 
+  inner_join(get_sentiments("afinn")) %>% 
+  add_count(word) %>% 
+  select(word, score, n) %>% 
+  arrange(-n) %>% 
+  unique() %>% 
+  filter(abs(score) > 1) %>% 
+  top_n(30) %>% 
+  ggplot(aes(x = reorder(word, score * n), y = n * score)) +
+  geom_col(aes(fill = ifelse(score > 0, "blue", "red")),
+           show.legend = FALSE) +
+  labs(x = "Word",
+       y = "Sentiment Contribution",
+       title = "Most Important Words in Springsteen Lyrics Sentiment Analysis") +
+  coord_flip() +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+Most common words
+
+```{r}
+bruce_words %>% 
+  anti_join(stop_words) %>% 
+  group_by(album, word) %>% 
+  summarise(n = n()) %>% 
+  top_n(4) %>% 
+  ggplot(aes(x = reorder(word, n), y = n )) +
+  geom_col(fill = "navyblue") +
+  labs(x = "",
+       y = "Number of Times Used",
+       title = "Most Common Words in Springsteen Lyrics") +
+  coord_flip() +
+  facet_wrap(~album, ncol = 3, scales = "free") +
+  theme(legend.position = "none",
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+#### Using ggraph and igraph to visualize bigrams
+
+```{r}
+count_bigrams <- function(dataset) {
+  dataset %>%
+    unnest_tokens(bigram, text, token = "ngrams", n = 2) %>%
+    separate(bigram, c("word1", "word2"), sep = " ") %>%
+    filter(!word1 %in% stop_words$word,
+           !word2 %in% stop_words$word) %>%
+    count(word1, word2, sort = TRUE)
+}
+
+visualize_bigrams <- function(bigrams) {
+  set.seed(2016)
+  a <- grid::arrow(type = "closed", length = unit(.10, "inches"))
+  
+  bigrams %>%
+    graph_from_data_frame() %>%
+    ggraph(layout = "fr") +
+    geom_edge_link(edge_alpha = .1, show.legend = FALSE, arrow = a) +
+    geom_node_point(color = "lightblue", size = 3) +
+    geom_node_text(aes(label = name), vjust = 1, hjust = 1) +
+    theme_void()
+}
+
+bruce_lyr %>% 
+  count_bigrams() %>%
+  filter(n > 7) %>% 
+  visualize_bigrams()
+```
+
+
